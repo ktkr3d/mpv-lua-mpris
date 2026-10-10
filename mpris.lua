@@ -290,6 +290,19 @@ local function publish_artwork(source_path, cache_dir, cache_key)
         return nil
     end
 
+    local hash1, hash2 = 5381, 52711
+    while true do
+        local chunk = input:read(65536)
+        if not chunk then break end
+        for i = 1, #chunk do
+            local byte = string.byte(chunk, i)
+            hash1 = bit.tobit(hash1 * 33 + byte)
+            hash2 = bit.tobit(hash2 * 65599 + byte)
+        end
+    end
+    input:seek("set", 0)
+    cache_key = cache_key .. "-" .. bit.tohex(hash1) .. bit.tohex(hash2)
+
     local header = input:read(12) or ""
     input:seek("set", 0)
     local ext = source_path:match("%.([%w]+)$")
@@ -399,7 +412,10 @@ local function update_cover_art()
             return
         end
         f:close()
-        active_art_url = file_url(dest_path)
+        local art_url = publish_artwork(dest_path, cache_dir, cache_key)
+        if not art_url then return end
+        os.remove(dest_path)
+        active_art_url = art_url
         if bus then
             sd.sd_bus_emit_properties_changed(
                 bus,
