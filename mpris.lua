@@ -8,11 +8,14 @@ if not r then
     error("this script requires LuaJIT, and mpv is not compiled with it")
 end
 
+local utils = require("mp.utils")
+
 ffi.cdef[[
     char *strerror(int errno);
 
     void *malloc(size_t size);
     void free(void *ptr);
+    int mkdir(const char *pathname, unsigned int mode);
 
     ssize_t read(int fd, void *buf, size_t count);
 
@@ -164,6 +167,8 @@ local message_append = sd.sd_bus_message_append
 local message_read = sd.sd_bus_message_read
 
 local bus = nil
+local active_art_url = ""
+local pending_artwork_timer = nil
 
 local function make_vtable(t)
     local vt = ffi.new("sd_bus_vtable[?]", #t)
@@ -224,6 +229,187 @@ local function message_append_as(m, t)
     end
     strv[#t] = nil
     return sd.sd_bus_message_append_strv(m, strv)
+end
+
+local function file_url(path)
+    path = path:gsub("([^%w%-%._~/])", function(char)
+        return string.format("%%%02X", string.byte(char))
+    end)
+    return "file://" .. path
+end
+
+local function artwork_cache_key(path)
+    if not path or path == "" then
+        path = mp.get_property("media-title", "unknown")
+    elseif path:match("^%a[%w+.-]*://") then
+        path = path:gsub("[?#].*$", "")
+    end
+
+    local hash1, hash2 = 5381, 52711
+    for i = 1, #path do
+        local byte = string.byte(path, i)
+        hash1 = bit.tobit(hash1 * 33 + byte)
+        hash2 = bit.tobit(hash2 * 65599 + byte)
+    end
+    return bit.tohex(hash1) .. bit.tohex(hash2)
+end
+
+local function artwork_cache_dir()
+    local cache_home = os.getenv("XDG_CACHE_HOME")
+    if not cache_home or cache_home == "" then
+        local home = os.getenv("HOME")
+        if not home or home == "" then
+            mp.msg.warn("MPRIS: cannot locate a cache directory for cover art")
+            return nil
+        end
+        cache_home = utils.join_path(home, ".cache")
+    end
+
+    local shim_cache = utils.join_path(cache_home, "jellyfin-mpv-shim")
+    local artwork_cache = utils.join_path(shim_cache, "artwork")
+    local art_dir = utils.join_path(artwork_cache, "mpris")
+    local dirs = {cache_home, shim_cache, artwork_cache, art_dir}
+    for _, dir in ipairs(dirs) do
+        local info = utils.file_info(dir)
+        if not (info and info.is_dir) then
+            ffi.C.mkdir(c(dir), 493)
+            info = utils.file_info(dir)
+            if not (info and info.is_dir) then
+                mp.msg.warn("MPRIS: cannot create cover-art cache directory: " .. dir)
+                return nil
+            end
+        end
+    end
+    return dirs[#dirs]
+end
+
+local function publish_artwork(source_path, cache_dir, cache_key)
+    local input, err = io.open(source_path, "rb")
+    if not input then
+        mp.msg.warn("MPRIS: cannot read cover art " .. source_path .. ": " .. tostring(err))
+        return nil
+    end
+
+    local header = input:read(12) or ""
+    input:seek("set", 0)
+    local ext = source_path:match("%.([%w]+)$")
+    if header:sub(1, 8) == "\137PNG\r\n\026\n" then
+        ext = "png"
+    elseif header:sub(1, 3) == "\255\216\255" then
+        ext = "jpg"
+    elseif header:sub(1, 6) == "GIF87a" or header:sub(1, 6) == "GIF89a" then
+        ext = "gif"
+    elseif header:sub(1, 4) == "RIFF" and header:sub(9, 12) == "WEBP" then
+        ext = "webp"
+    elseif not ext then
+        ext = "img"
+    end
+    local filename = "mpris-" .. cache_key .. "." .. ext:lower()
+    local dest_path = utils.join_path(cache_dir, filename)
+    local output
+    output, err = io.open(dest_path, "wb")
+    if not output then
+        input:close()
+        mp.msg.warn("MPRIS: cannot write cover-art cache: " .. tostring(err))
+        return nil
+    end
+
+    while true do
+        local chunk = input:read(65536)
+        if not chunk then break end
+        local ok
+        ok, err = output:write(chunk)
+        if not ok then
+            input:close()
+            output:close()
+            os.remove(dest_path)
+            mp.msg.warn("MPRIS: cannot write cover-art cache: " .. tostring(err))
+            return nil
+        end
+    end
+    input:close()
+    output:close()
+    return file_url(dest_path)
+end
+
+local function update_cover_art()
+    active_art_url = ""
+
+    if pending_artwork_timer then
+        pending_artwork_timer:kill()
+        pending_artwork_timer = nil
+    end
+
+    local cache_dir = artwork_cache_dir()
+    if not cache_dir then return end
+
+    local path = mp.get_property("path")
+    local cache_key = artwork_cache_key(path)
+    local cover_art_files = mp.get_property_native("cover-art-files", {})
+    if type(cover_art_files) == "table" then
+        for _, cover_path in ipairs(cover_art_files) do
+            local art_url = publish_artwork(cover_path, cache_dir, cache_key)
+            if art_url then
+                active_art_url = art_url
+                return
+            end
+        end
+    end
+
+    if not path then
+        return
+    end
+
+    local dir, _ = utils.split_path(path)
+    if dir then
+        local extensions = {"jpg", "jpeg", "png"}
+        local names = {"cover", "folder", "front"}
+        for _, name in ipairs(names) do
+            for _, ext in ipairs(extensions) do
+                local local_art = dir .. name .. "." .. ext
+                local f = io.open(local_art, "rb")
+                if f then
+                    f:close()
+                    local art_url = publish_artwork(local_art, cache_dir, cache_key)
+                    if art_url then
+                        active_art_url = art_url
+                        return
+                    end
+                end
+            end
+        end
+    end
+
+    local filename = "mpris-" .. cache_key .. ".jpg"
+    local dest_path = utils.join_path(cache_dir, filename)
+    pending_artwork_timer = mp.add_timeout(1, function()
+        pending_artwork_timer = nil
+        if mp.get_property("path") ~= path or active_art_url ~= "" then return end
+
+        os.remove(dest_path)
+        local ok, err = mp.commandv("screenshot-to-file", dest_path, "video")
+        if not ok then
+            mp.msg.warn("MPRIS: cover-art capture failed: " .. tostring(err))
+            return
+        end
+
+        local f, open_err = io.open(dest_path, "r")
+        if not f then
+            mp.msg.warn("MPRIS: cannot read captured cover art: " .. tostring(open_err))
+            return
+        end
+        f:close()
+        active_art_url = file_url(dest_path)
+        if bus then
+            sd.sd_bus_emit_properties_changed(
+                bus,
+                "/org/mpris/MediaPlayer2",
+                "org.mpris.MediaPlayer2.Player",
+                "Metadata",
+                nil
+            )
+        end
+    end)
 end
 
 local mpris_def = {
@@ -590,15 +776,18 @@ local player_def = {
         if duration ~= nil then
             dict["mpris:length"] = {"x", ffi.cast("int64_t", duration * 1000000)}
         end
+        if active_art_url ~= "" then
+            dict["mpris:artUrl"] = {"s", active_art_url}
+        end
         local args = {}
-        local n = 0
+        local count = 0
         for key, value in pairs(dict) do
             table.insert(args, key)
             table.insert(args, value[1])
             table.insert(args, value[2])
-            n = n + 1
+            count = count + 1
         end
-        return message_append(m, "a{sv}", ffi.cast("int", n), unpack(args))
+        return message_append(m, "a{sv}", ffi.cast("int", count), unpack(args))
     end)},
     {"W", c"Volume", c"d", getter(function(b, p, i, pp, m)
         local v = mp.get_property_number("volume", 100)
@@ -809,6 +998,15 @@ end
 mp.observe_property("playlist-pos", nil, metadata_observer)
 mp.observe_property("media-title", nil, metadata_observer)
 mp.observe_property("duration", nil, metadata_observer)
+
+mp.register_event("file-loaded", function()
+    update_cover_art()
+    emit_changed("org.mpris.MediaPlayer2.Player", "Metadata")
+end)
+mp.observe_property("cover-art-files", nil, function()
+    update_cover_art()
+    emit_changed("org.mpris.MediaPlayer2.Player", "Metadata")
+end)
 
 local function volume_observer()
     emit_changed("org.mpris.MediaPlayer2.Player", "Volume")
