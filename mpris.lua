@@ -783,18 +783,34 @@ local player_def = {
         local pos = mp.get_property("playlist-pos", "0")
         local title = mp.get_property("media-title")
         local duration = mp.get_property_number("duration")
-        local artist = mp.get_property_native("metadata/by-key/artist")
-        local album = mp.get_property_native("metadata/by-key/album")
-        local artists = {}
-        if type(artist) == "table" then
-            for _, name in ipairs(artist) do
-                if type(name) == "string" and name ~= "" then
-                    table.insert(artists, name)
+        local function metadata_strings(key)
+            local value = mp.get_property_native("metadata/by-key/" .. key)
+            local strings = {}
+            if type(value) == "table" then
+                for _, item in ipairs(value) do
+                    if type(item) == "string" and item ~= "" then
+                        table.insert(strings, item)
+                    end
                 end
+            elseif type(value) == "string" and value ~= "" then
+                table.insert(strings, value)
             end
-        elseif type(artist) == "string" and artist ~= "" then
-            table.insert(artists, artist)
+            return strings
         end
+        local function metadata_integer(key)
+            local value = mp.get_property_native("metadata/by-key/" .. key)
+            if type(value) == "number" then
+                return math.floor(value)
+            elseif type(value) == "string" then
+                return tonumber(value:match("^%s*(%d+)"))
+            end
+        end
+        local artists = metadata_strings("artist")
+        local album = mp.get_property_native("metadata/by-key/album")
+        local album_artists = metadata_strings("album_artist")
+        local genres = metadata_strings("genre")
+        local track_number = metadata_integer("track")
+        local disc_number = metadata_integer("disc")
         local dict = {
             ["mpris:trackid"] = {"o", "/" .. pos},
         }
@@ -806,6 +822,18 @@ local player_def = {
         end
         if type(album) == "string" and album ~= "" then
             dict["xesam:album"] = {"s", album}
+        end
+        if #album_artists > 0 then
+            dict["xesam:albumArtist"] = {"as", album_artists}
+        end
+        if #genres > 0 then
+            dict["xesam:genre"] = {"as", genres}
+        end
+        if track_number then
+            dict["xesam:trackNumber"] = {"i", ffi.cast("int", track_number)}
+        end
+        if disc_number then
+            dict["xesam:discNumber"] = {"i", ffi.cast("int", disc_number)}
         end
         if duration ~= nil then
             dict["mpris:length"] = {"x", ffi.cast("int64_t", duration * 1000000)}
