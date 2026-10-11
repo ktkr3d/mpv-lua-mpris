@@ -393,6 +393,10 @@ local function update_cover_art()
         end
     end
 
+    if mp.get_property("vid", "no") == "no" then
+        return
+    end
+
     local filename = "mpris-" .. cache_key .. ".jpg"
     local dest_path = utils.join_path(cache_dir, filename)
     pending_artwork_timer = mp.add_timeout(1, function()
