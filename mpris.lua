@@ -783,11 +783,25 @@ local player_def = {
         local pos = mp.get_property("playlist-pos", "0")
         local title = mp.get_property("media-title")
         local duration = mp.get_property_number("duration")
+        local artist = mp.get_property_native("metadata/by-key/artist")
+        local artists = {}
+        if type(artist) == "table" then
+            for _, name in ipairs(artist) do
+                if type(name) == "string" and name ~= "" then
+                    table.insert(artists, name)
+                end
+            end
+        elseif type(artist) == "string" and artist ~= "" then
+            table.insert(artists, artist)
+        end
         local dict = {
             ["mpris:trackid"] = {"o", "/" .. pos},
         }
         if title ~= nil then
             dict["xesam:title"] = {"s", title}
+        end
+        if #artists > 0 then
+            dict["xesam:artist"] = {"as", artists}
         end
         if duration ~= nil then
             dict["mpris:length"] = {"x", ffi.cast("int64_t", duration * 1000000)}
@@ -800,7 +814,14 @@ local player_def = {
         for key, value in pairs(dict) do
             table.insert(args, key)
             table.insert(args, value[1])
-            table.insert(args, value[2])
+            if value[1] == "as" then
+                table.insert(args, ffi.cast("int", #value[2]))
+                for _, item in ipairs(value[2]) do
+                    table.insert(args, item)
+                end
+            else
+                table.insert(args, value[2])
+            end
             count = count + 1
         end
         return message_append(m, "a{sv}", ffi.cast("int", count), unpack(args))
@@ -1014,6 +1035,7 @@ end
 mp.observe_property("playlist-pos", nil, metadata_observer)
 mp.observe_property("media-title", nil, metadata_observer)
 mp.observe_property("duration", nil, metadata_observer)
+mp.observe_property("metadata", nil, metadata_observer)
 
 mp.register_event("file-loaded", function()
     update_cover_art()
