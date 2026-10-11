@@ -784,6 +784,7 @@ local player_def = {
         local title = mp.get_property("media-title")
         local duration = mp.get_property_number("duration")
         local artist = mp.get_property_native("metadata/by-key/artist")
+        local album = mp.get_property_native("metadata/by-key/album")
         local artists = {}
         if type(artist) == "table" then
             for _, name in ipairs(artist) do
@@ -802,6 +803,9 @@ local player_def = {
         end
         if #artists > 0 then
             dict["xesam:artist"] = {"as", artists}
+        end
+        if type(album) == "string" and album ~= "" then
+            dict["xesam:album"] = {"s", album}
         end
         if duration ~= nil then
             dict["mpris:length"] = {"x", ffi.cast("int64_t", duration * 1000000)}
